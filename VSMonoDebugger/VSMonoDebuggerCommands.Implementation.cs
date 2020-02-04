@@ -11,22 +11,20 @@ using System.Threading.Tasks;
 using System.Windows;
 using VSMonoDebugger.Services;
 using VSMonoDebugger.Settings;
-using VSMonoDebugger.SSH;
+using VSMonoDebugger.Debuggers;
 using VSMonoDebugger.Views;
 
 namespace VSMonoDebugger
 {
     internal sealed partial class VSMonoDebuggerCommands
     {
-        private static MonoVisualStudioExtension _monoExtension;
-
         private void InstallMenu(OleMenuCommandService commandService)
         {
-            AddMenuItem(commandService, CommandIds.cmdDeployAndDebugOverSSH, CheckStartupProjects, DeployAndDebugOverSSHClicked);
-            AddMenuItem(commandService, CommandIds.cmdDeployOverSSH, CheckStartupProjects, DeployOverSSHClicked);
-            AddMenuItem(commandService, CommandIds.cmdDebugOverSSH, CheckStartupProjects, DebugOverSSHClicked);
-            AddMenuItem(commandService, CommandIds.cmdAttachToMonoDebuggerWithoutSSH, CheckStartupProjects, AttachToMonoDebuggerWithoutSSHClicked);
-            AddMenuItem(commandService, CommandIds.cmdBuildProjectWithMDBFiles, CheckStartupProjects, BuildProjectWithMDBFilesClicked);
+            AddMenuItem(commandService, CommandIds.cmdDeployAndDebugOverSSH, SetMenuTextAndVisibility, DeployAndDebugOverSSHClicked);
+            AddMenuItem(commandService, CommandIds.cmdDeployOverSSH, SetMenuTextAndVisibility, DeployOverSSHClicked);
+            AddMenuItem(commandService, CommandIds.cmdDebugOverSSH, SetMenuTextAndVisibility, DebugOverSSHClicked);
+            AddMenuItem(commandService, CommandIds.cmdAttachToMonoDebuggerWithoutSSH, SetMenuTextAndVisibility, AttachToMonoDebuggerWithoutSSHClicked);
+            AddMenuItem(commandService, CommandIds.cmdBuildProjectWithMDBFiles, SetMenuTextAndVisibility, BuildProjectWithMDBFilesClicked);
 
             AddMenuItem(commandService, CommandIds.cmdOpenLogFile, CheckOpenLogFile, OpenLogFile);
             AddMenuItem(commandService, CommandIds.cmdOpenDebugSettings, null, OpenSSHDebugConfigDlg);
@@ -53,6 +51,64 @@ namespace VSMonoDebugger
                 MessageBox.Show(
                     $"Logfile {NLogService.LoggerPath} not found!",
                     "VSMonoDebugger", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void SetMenuTextAndVisibility(object sender, EventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            var menuCommand = sender as OleMenuCommand;
+            if (menuCommand != null)
+            {
+                var allDeviceSettings = UserSettingsManager.Instance.Load();
+                var settings = allDeviceSettings.CurrentUserSettings;
+                var debuggerName = settings.UseDotnetCoreDebugger ? "dotnet" : "mono";
+                var withMdbFiles = settings.UseDotnetCoreDebugger ? "" : "with MDB files";
+                var remoteName = settings.DeployAndDebugOnLocalWindowsSystem ? "Local" : "SSH";
+                if (menuCommand.CommandID.ID == CommandIds.cmdAttachToMonoDebuggerWithoutSSH)
+                {
+                    menuCommand.Text = $"{GetMenuText(menuCommand.CommandID.ID)} [mono debugger] (TCP {settings.SSHHostIP})";
+                    menuCommand.Enabled = settings.UseDotnetCoreDebugger == false && _monoExtension.IsStartupProjectAvailable();
+                    menuCommand.Visible = settings.UseDotnetCoreDebugger == false && _monoExtension.IsStartupProjectAvailable();
+                }
+                else
+                {
+                    if (menuCommand.CommandID.ID == CommandIds.cmdBuildProjectWithMDBFiles)
+                    {
+                        menuCommand.Text = $"{GetMenuText(menuCommand.CommandID.ID)} {withMdbFiles}";
+                    }
+                    else
+                    {
+                        menuCommand.Text = $"{GetMenuText(menuCommand.CommandID.ID)} [{debuggerName} debugger] ({remoteName} {settings.SSHHostIP})";                        
+                    }
+
+                    menuCommand.Enabled = _monoExtension.IsStartupProjectAvailable();
+                }
+            }
+        }
+
+        private string GetMenuText(int commandId)
+        {
+            switch (commandId)
+            {
+                case CommandIds.cmdDeployAndDebugOverSSH:
+                    return "Deploy, Run and Debug";
+                case CommandIds.cmdDeployOverSSH:
+                    return "Deploy";
+                case CommandIds.cmdDebugOverSSH:
+                    return "Run and Debug";
+                case CommandIds.cmdAttachToMonoDebuggerWithoutSSH:
+                    return "Attach to mono debugger";
+                case CommandIds.cmdBuildProjectWithMDBFiles:
+                    return "Build Startup Project";
+
+                case CommandIds.cmdOpenLogFile:
+                    return "Open Logfile";
+                case CommandIds.cmdOpenDebugSettings:
+                    return "Settings ...";
+                default:
+                    return $"Unknown CommandID {commandId}";
             }
         }
 
@@ -92,12 +148,12 @@ namespace VSMonoDebugger
             await BuildProjectWithMDBFilesAsync();
         }
 
-        private void OpenSSHDebugConfigDlg(object sender, EventArgs e)
+        private async void OpenSSHDebugConfigDlg(object sender, EventArgs e)
         {
-            ThreadHelper.ThrowIfNotOnUIThread();
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
             // https://docs.microsoft.com/en-us/visualstudio/extensibility/creating-and-managing-modal-dialog-boxes?view=vs-2019
-            var vsUIShell = ServiceProvider.GetService(typeof(SVsUIShell)) as IVsUIShell;
+            var vsUIShell = await _asyncServiceProvider.GetServiceAsync(typeof(SVsUIShell)) as IVsUIShell;
             Assumes.Present(vsUIShell);
 
             var dlg = new DebugSettings(vsUIShell);
@@ -128,11 +184,11 @@ namespace VSMonoDebugger
             // TODO stop monoRemoteSshDebugTask properly
             try
             {
-                NLogService.Logger.Info($"===== {nameof(DeployAndRunCommandOverSSHAsync)} =====");
+                Logger.Info($"===== {nameof(DeployAndRunCommandOverSSHAsync)} =====");
 
                 if (!_monoExtension.IsStartupProjectAvailable())
                 {
-                    NLogService.Logger.Info($"No startup project/solution loaded yet.");
+                    Logger.Info($"No startup project/solution loaded yet.");
                     return false;
                 }
 
@@ -146,44 +202,62 @@ namespace VSMonoDebugger
                 if (debuggerMode.HasFlag(DebuggerMode.DeployOverSSH))
                 {
                     await _monoExtension.BuildStartupProjectAsync();
-                    await _monoExtension.CreateMdbForAllDependantProjectsAsync(HostOutputWindowEx.WriteLineLaunchError);
+                    if (settings.UseDotnetCoreDebugger == false)
+                    {
+                        await _monoExtension.CreateMdbForAllDependantProjectsAsync(HostOutputWindowEx.WriteLineLaunchError);
+                    }
                 }
 
-                var monoRemoteSshDebugTask = System.Threading.Tasks.Task.CompletedTask;
+                IDebugger debugger = settings.DeployAndDebugOnLocalWindowsSystem ? 
+                    (IDebugger)new LocalWindowsDebugger() :
+                    settings.UseDotnetCoreDebugger ? (IDebugger)new SSHDebuggerDotnet(options) : new SSHDebuggerMono(options);
+
+                System.Threading.Tasks.Task<bool> monoRemoteSshDebugTask = null;
 
                 if (debuggerMode.HasFlag(DebuggerMode.DeployOverSSH) && debuggerMode.HasFlag(DebuggerMode.DebugOverSSH))
                 {
-                    monoRemoteSshDebugTask = await SSHDebugger.DeployAndDebugAsync(options, debugOptions, HostOutputWindowEx.WriteLaunchErrorAsync, settings.RedirectOutputOption);
+                    monoRemoteSshDebugTask = debugger.DeployRunAndDebugAsync(debugOptions, HostOutputWindowEx.WriteLaunchErrorAsync, settings.RedirectOutputOption);
                 }
                 else if (debuggerMode.HasFlag(DebuggerMode.DeployOverSSH))
                 {
-                    monoRemoteSshDebugTask = await SSHDebugger.DeployAsync(options, debugOptions, HostOutputWindowEx.WriteLaunchErrorAsync, settings.RedirectOutputOption);
+                    monoRemoteSshDebugTask = debugger.DeployAsync(debugOptions, HostOutputWindowEx.WriteLaunchErrorAsync, settings.RedirectOutputOption);
                 }
                 else if (debuggerMode.HasFlag(DebuggerMode.DebugOverSSH))
                 {
-                    monoRemoteSshDebugTask = await SSHDebugger.DebugAsync(options, debugOptions, HostOutputWindowEx.WriteLaunchErrorAsync, settings.RedirectOutputOption);
+                    monoRemoteSshDebugTask = debugger.RunAndDebugAsync(debugOptions, HostOutputWindowEx.WriteLaunchErrorAsync, settings.RedirectOutputOption);
                 }
 
                 if (debuggerMode.HasFlag(DebuggerMode.AttachProcess))
                 {
-                    _monoExtension.AttachDebuggerToRunningProcess(debugOptions);
+                    if (settings.UseDotnetCoreDebugger)
+                    {
+                        var myresult = await monoRemoteSshDebugTask;
+                        _monoExtension.AttachDotnetDebuggerToRunningProcess(debugOptions);                        
+                    }
+                    else
+                    {
+                        _monoExtension.AttachMonoDebuggerToRunningProcess(debugOptions);
+                    }
                 }
 
-                await monoRemoteSshDebugTask;
+                if (monoRemoteSshDebugTask != null)
+                {
+                    var myresult = await monoRemoteSshDebugTask;
+                }
 
                 return true;
             }
             catch (Exception ex)
             {
-                HostOutputWindowEx.WriteLineLaunchErrorAsync(ex.Message);
-                NLogService.Logger.Error(ex);
+                await HostOutputWindowEx.WriteLineLaunchErrorAsync(ex.Message);
+                Logger.Error(ex);
                 MessageBox.Show(ex.Message, "VSMonoDebugger", MessageBoxButton.OK, MessageBoxImage.Error);
             }
 
             return false;
         }
 
-        private static void CreateDebugOptions(out UserSettings settings, out DebugOptions debugOptions, out SshDeltaCopy.Options options)
+        private void CreateDebugOptions(out UserSettings settings, out DebugOptions debugOptions, out SshDeltaCopy.Options options)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
@@ -199,18 +273,23 @@ namespace VSMonoDebugger
                     {
                         if (!string.IsNullOrWhiteSpace(localProjectConfig.Value.SSHDeployPath))
                         {
-                            NLogService.Logger.Info($"SSHDeployPath = {settings.SSHDeployPath} was overwritten with local *.VSMonoDebugger.config: {localProjectConfig.Value.SSHDeployPath}");
+                            Logger.Info($"SSHDeployPath = {settings.SSHDeployPath} was overwritten with local *.VSMonoDebugger.config: {localProjectConfig.Value.SSHDeployPath}");
                             settings.SSHDeployPath = localProjectConfig.Value.SSHDeployPath;
+                        }
+                        if (!string.IsNullOrWhiteSpace(localProjectConfig.Value.WindowsDeployPath))
+                        {
+                            Logger.Info($"WindowsDeployPath = {settings.WindowsDeployPath} was overwritten with local *.VSMonoDebugger.config: {localProjectConfig.Value.WindowsDeployPath}");
+                            settings.WindowsDeployPath = localProjectConfig.Value.WindowsDeployPath;
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    NLogService.Logger.Error(ex);
+                    Logger.Error(ex);
                 }               
             }            
 
-            debugOptions = _monoExtension.CreateDebugOptions(settings, true);
+            debugOptions = _monoExtension.CreateDebugOptions(settings);
             options = new SshDeltaCopy.Options()
             {
                 Host = settings.SSHHostIP,
@@ -230,18 +309,15 @@ namespace VSMonoDebugger
         {
             try
             {
-                NLogService.Logger.Info($"===== {nameof(BuildProjectWithMDBFilesAsync)} =====");
+                Logger.Info($"===== {nameof(BuildProjectWithMDBFilesAsync)} =====");
 
                 if (!_monoExtension.IsStartupProjectAvailable())
                 {
-                    NLogService.Logger.Info($"No startup project/solution loaded yet.");
+                    Logger.Info($"No startup project/solution loaded yet.");
                     return false;
                 }
 
-                UserSettings settings;
-                DebugOptions debugOptions;
-                SshDeltaCopy.Options options;
-                CreateDebugOptions(out settings, out debugOptions, out options);
+                CreateDebugOptions(out UserSettings settings, out DebugOptions debugOptions, out SshDeltaCopy.Options options);
 
                 await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
                 await _monoExtension.BuildStartupProjectAsync();
@@ -252,7 +328,7 @@ namespace VSMonoDebugger
             catch (Exception ex)
             {
                 await HostOutputWindowEx.WriteLineLaunchErrorAsync(ex.Message);
-                NLogService.Logger.Error(ex);
+                Logger.Error(ex);
                 MessageBox.Show(ex.Message, "VSMonoDebugger", MessageBoxButton.OK, MessageBoxImage.Error);
             }
 

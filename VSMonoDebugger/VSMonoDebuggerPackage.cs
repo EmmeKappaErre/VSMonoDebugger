@@ -1,9 +1,11 @@
-﻿using System;
+﻿using Microsoft.VisualStudio.Shell;
+using Microsoft.VisualStudio.Shell.Interop;
+using NLog;
+using System;
+using System.ComponentModel.Design;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Threading;
-using Microsoft.VisualStudio.Shell;
-using Microsoft.VisualStudio.Shell.Interop;
 using VSMonoDebugger.Services;
 using VSMonoDebugger.Settings;
 
@@ -29,11 +31,13 @@ namespace VSMonoDebugger
     [PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
     [InstalledProductRegistration("#110", "#112", "1.0", IconResourceID = 400)] // Info on this package for Help/About
     [Guid(VSMonoDebuggerPackage.PackageGuidString)]
-    //[ProvideAutoLoad(UIContextGuids80.SolutionExists, PackageAutoLoadFlags.BackgroundLoad)]
+    [ProvideAutoLoad(UIContextGuids80.SolutionExists, PackageAutoLoadFlags.BackgroundLoad)]
     [SuppressMessage("StyleCop.CSharp.DocumentationRules", "SA1650:ElementDocumentationMustBeSpelledCorrectly", Justification = "pkgdef, VS and vsixmanifest are valid VS terms")]
     [ProvideMenuResource("Menus.ctmenu", 1)]
     public sealed class VSMonoDebuggerPackage : AsyncPackage
     {
+        private static readonly Logger Logger = LogManager.GetCurrentClassLogger();
+
         /// <summary>
         /// VSMonoDebuggerPackage GUID string.
         /// </summary>
@@ -52,6 +56,9 @@ namespace VSMonoDebugger
 
         #region Package Members
 
+        private MonoVisualStudioExtension _monoVisualStudioExtension;
+        private VSMonoDebuggerCommands _monoDebuggerCommands;
+
         /// <summary>
         /// Initialization of the package; this method is called right after the package is sited, so this is the place
         /// where you can put all the initialization code that rely on services provided by VisualStudio.
@@ -63,9 +70,16 @@ namespace VSMonoDebugger
                 NLogService.Setup($"{nameof(VSMonoDebuggerPackage)}.log");
                 DebugEngineInstallService.TryRegisterAssembly();
 
+                // see https://github.com/microsoft/VSSDK-Extensibility-Samples/tree/master/AsyncPackageMigration
                 await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
+
+                var dte = await GetServiceAsync(typeof(EnvDTE.DTE)) as EnvDTE.DTE;
+                var menuCommandService = await GetServiceAsync(typeof(IMenuCommandService)) as OleMenuCommandService;
+
+                // TODO replace by services
                 UserSettingsManager.Initialize(this);
-                VSMonoDebuggerCommands.Initialize(this);
+                _monoVisualStudioExtension = new MonoVisualStudioExtension(this, dte);
+                _monoDebuggerCommands = new VSMonoDebuggerCommands(this, menuCommandService, _monoVisualStudioExtension);
             }
             catch (UnauthorizedAccessException uex)
             {
@@ -80,11 +94,11 @@ namespace VSMonoDebugger
                 OLEMSGBUTTON.OLEMSGBUTTON_OK,
                 OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_FIRST);
 
-                NLogService.Logger.Error(uex);
+                Logger.Error(uex);
             }
             catch (Exception ex)
             {
-                NLogService.Logger.Error(ex);
+                Logger.Error(ex);
             }
 
             await base.InitializeAsync(cancellationToken, progress);

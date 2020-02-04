@@ -15,6 +15,7 @@ using System.Diagnostics;
 using VSMonoDebugger.Services;
 using VSMonoDebugger.Settings;
 using Mono.Debugging.VisualStudio;
+using Newtonsoft.Json;
 
 namespace VSMonoDebugger
 {
@@ -25,20 +26,56 @@ namespace VSMonoDebugger
         /// </summary>
         public readonly static string VS_PROJECTKIND_SOLUTION_FOLDER = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
 
-        private readonly Package _package;
-        private readonly DTE _dte;
-        private readonly ErrorListProvider _errorListProvider;
-        private static readonly Logger logger = LogManager.GetCurrentClassLogger();
+        protected static readonly Logger Logger = LogManager.GetCurrentClassLogger();
 
-        public MonoVisualStudioExtension(Package package)
+        private DTE _dte;
+        private CommandEvents _startCommandEvents;
+        private readonly ErrorListProvider _errorListProvider;
+
+        public MonoVisualStudioExtension(Package package, DTE dte)
         {
-            _package = package;
-            _dte = package.GetService<DTE>();
+            _dte = dte;
             _errorListProvider = new ErrorListProvider(package);
         }
 
-        internal async Task BuildStartupProjectAsync()
+        public static string GetExtensionInstallationDirectoryOrNull()
         {
+            try
+            {
+                var uri = new Uri(typeof(MonoVisualStudioExtension).Assembly.CodeBase, UriKind.Absolute);
+                return Path.GetDirectoryName(uri.LocalPath);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public async Task OverrideRunCommandAsync()
+        {
+            NLogService.TraceEnteringMethod(Logger);
+
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+            // https://stackoverflow.com/questions/15908652/how-to-programmatically-override-the-build-and-launch-actions
+            // https://visualstudioextensions.vlasovstudio.com/2017/06/29/changing-visual-studio-2017-private-registry-settings/
+            // https://github.com/3F/vsCommandEvent
+            var _dteEvents = _dte.Events;
+            _startCommandEvents = _dte.Events.CommandEvents["{5EFC7975-14BC-11CF-9B2B-00AA00573819}", 295];
+            _startCommandEvents.BeforeExecute += OnBeforeStartCommand;
+        }
+
+        private void OnBeforeStartCommand(string guid, int id, object customIn, object customOut, ref bool cancelDefault)
+        {
+            NLogService.TraceEnteringMethod(Logger);
+
+            //your event handler this command
+        }
+
+        public async Task BuildStartupProjectAsync()
+        {
+            NLogService.TraceEnteringMethod(Logger);
+
             await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
             
             var failedBuilds = BuildStartupProject();
@@ -55,7 +92,7 @@ namespace VSMonoDebugger
             }
         }
 
-        internal int BuildStartupProject()
+        private int BuildStartupProject()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
@@ -67,13 +104,13 @@ namespace VSMonoDebugger
                 var activeConfiguration = _dte.Solution.SolutionBuild.ActiveConfiguration;
                 var activeConfigurationName = activeConfiguration.Name;
                 var startProjectName = startProject.FullName;
-                LogInfo($"BuildProject {startProject.FullName} {activeConfiguration.Name}");
+                Logger.Info($"BuildProject {startProject.FullName} {activeConfiguration.Name}");
                 sb.BuildProject(activeConfiguration.Name, startProject.FullName, true);                
             }
             catch (Exception ex)
             {
-                LogError(ex);
-                LogInfo($"BuildProject failed - Fallback: BuildSolution");
+                NLogService.LogError(Logger, ex);
+                Logger.Info($"BuildProject failed - Fallback: BuildSolution");
                 // Build complete solution (fallback solution)
                 return BuildSolution();
             }
@@ -81,17 +118,26 @@ namespace VSMonoDebugger
             return sb.LastBuildInfo;
         }
 
-        internal int BuildSolution()
+        private int BuildSolution()
         {
+            NLogService.TraceEnteringMethod(Logger);
             ThreadHelper.ThrowIfNotOnUIThread();
 
-            var sb = (SolutionBuild2)_dte.Solution.SolutionBuild;
-            LogInfo($"BuildSolution");
+            var sb = (SolutionBuild2)_dte.Solution.SolutionBuild;            
             sb.Build(true);
             return sb.LastBuildInfo;
         }
 
-        internal string GetStartupAssemblyPath()
+        private string GetStartupProjectPath()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            Project startupProject = GetStartupProject();
+            var projectFullName = startupProject.FullName;
+            return Path.GetDirectoryName(projectFullName);
+        }
+
+        private string GetStartupAssemblyPath()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
@@ -101,6 +147,8 @@ namespace VSMonoDebugger
 
         public bool IsStartupProjectAvailable()
         {
+            //NLogService.TraceEnteringMethod(Logger);
+
             ThreadHelper.ThrowIfNotOnUIThread();
 
             var sb = (SolutionBuild2)_dte.Solution.SolutionBuild;
@@ -109,6 +157,8 @@ namespace VSMonoDebugger
 
         public VSMonoDebuggerProjectSettings? GetProjectSettingsFromStartupProject()
         {
+            NLogService.TraceEnteringMethod(Logger);
+
             try
             {
                 ThreadHelper.ThrowIfNotOnUIThread();
@@ -120,7 +170,7 @@ namespace VSMonoDebugger
                     var projectConfigFile = Path.ChangeExtension(projectFullName, ".VSMonoDebugger.config");
                     if (File.Exists(projectConfigFile))
                     {
-                        LogInfo($"Local project config file {projectConfigFile} found.");
+                        Logger.Info($"Local project config file {projectConfigFile} found.");
                         var projectConfigFileContent = File.ReadAllText(projectConfigFile);
                         return VSMonoDebuggerProjectSettings.DeserializeFromJson(projectConfigFileContent);
                     }
@@ -128,7 +178,10 @@ namespace VSMonoDebugger
             }
             catch (Exception ex)
             {
-                LogError(ex);
+                // *.VSMonoDebugger.config can contain illigal escape characters for WindowsPath "C:\Temp" => "C:\\Temp"
+                // Don't fix it ... user has to be json conform
+                Logger.Info("Please validate that the local project config file (*.VSMonoDebugger.config) conatins no illigal escape character sequences for WindowsDeployPath!");
+                NLogService.LogError(Logger, ex);
             }
 
             return null;
@@ -155,7 +208,7 @@ namespace VSMonoDebugger
                         }
                         else
                         {
-                            LogInfo($"Only C# projects are supported as startup project! ProjectName = {project.Name} Language = {project.CodeModel.Language}");
+                            Logger.Info($"Only C# projects are supported as startup project! ProjectName = {project.Name} Language = {project.CodeModel.Language}");
                         }
                     }
                 }
@@ -168,7 +221,7 @@ namespace VSMonoDebugger
             throw new ArgumentException($"No startup project found! Checked projects in StartupProjects = '{string.Join(",", startupProjects.ToArray())}'");
         }
 
-        public static IList<Project> Projects(Solution solution)
+        private IList<Project> Projects(Solution solution)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
@@ -222,7 +275,7 @@ namespace VSMonoDebugger
             return list;
         }
 
-        internal string GetAssemblyPath(Project vsProject)
+        private string GetAssemblyPath(Project vsProject)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
@@ -235,13 +288,13 @@ namespace VSMonoDebugger
             if (outputDir == null)
             {
                 outputDir = string.Empty;
-                LogInfo($"GetFullOutputPath returned null! Using fallback: '{outputDir}'");
+                Logger.Info($"GetFullOutputPath returned null! Using fallback: '{outputDir}'");
             }
             string outputFileName = vsProject.Properties.Item("OutputFileName").Value.ToString();
             if (string.IsNullOrEmpty(outputFileName))
             {
                 outputFileName = $"{vsProject.Name}.exe";
-                LogInfo($"OutputFileName for project {vsProject.Name} is empty! Using fallback: {outputFileName}");
+                Logger.Info($"OutputFileName for project {vsProject.Name} is empty! Using fallback: {outputFileName}");
             }
             string assemblyPath = Path.Combine(outputDir, outputFileName);
             return assemblyPath;
@@ -257,12 +310,12 @@ namespace VSMonoDebugger
             }
             catch (Exception ex)
             {
-                LogInfo($"Project doesn't support property vsProject.CodeModel.Language! No CSharp project. {ex.Message}");
+                Logger.Info($"Project doesn't support property vsProject.CodeModel.Language! No CSharp project. {ex.Message}");
                 return false;
             }
         }
 
-        internal string GetStartArguments()
+        private string GetStartArguments()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
@@ -274,13 +327,15 @@ namespace VSMonoDebugger
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"{nameof(GetStartArguments)}: {ex.Message} {ex.StackTrace}");
+                NLogService.LogError(Logger, ex);
                 return string.Empty;
             }
         }
         
-        internal void AttachDebuggerToRunningProcess(DebugOptions debugOptions)
+        public void AttachMonoDebuggerToRunningProcess(DebugOptions debugOptions)
         {
+            NLogService.TraceEnteringMethod(Logger);
+
             ThreadHelper.ThrowIfNotOnUIThread();
 
             if (DebugEngineGuids.UseAD7Engine == EngineType.XamarinEngine)
@@ -296,14 +351,14 @@ namespace VSMonoDebugger
                 var dbg = sp.GetService(typeof(SVsShellDebugger)) as IVsDebugger;
                 if (dbg == null)
                 {
-                    logger.Error($"GetService did not returned SVsShellDebugger");
+                    Logger.Error($"GetService did not returned SVsShellDebugger");
                 }
                 int hr = dbg.LaunchDebugTargets(1, pInfo);
                 Marshal.ThrowExceptionForHR(hr);                
             }
             catch (Exception ex)
             {
-                logger.Error(ex);
+                NLogService.LogError(Logger, ex);
                 string msg = null;
                 var sh = sp.GetService(typeof(SVsUIShell)) as IVsUIShell;
                 if (sh != null)
@@ -312,7 +367,7 @@ namespace VSMonoDebugger
                 }
                 if (!string.IsNullOrWhiteSpace(msg))
                 {
-                    logger.Error(msg);
+                    Logger.Error(msg);
                 }
                 throw;
             }
@@ -320,16 +375,6 @@ namespace VSMonoDebugger
             {
                 if (pInfo != IntPtr.Zero)
                     Marshal.FreeCoTaskMem(pInfo);
-            }
-        }
-        
-        public static string ComputeHash(string file)
-        {
-            using (FileStream stream = File.OpenRead(file))
-            {
-                var sha = new SHA256Managed();
-                byte[] checksum = sha.ComputeHash(stream);
-                return BitConverter.ToString(checksum).Replace("-", string.Empty);
             }
         }
 
@@ -363,43 +408,165 @@ namespace VSMonoDebugger
             Marshal.StructureToPtr(info, pInfo, false);
             return pInfo;
         }
-        
-        public DebugOptions CreateDebugOptions(UserSettings settings, bool useSSH = false)
+
+        /// <summary>
+        /// We don't want to create a launch.json file
+        /// Currently not working!
+        /// </summary>
+        /// <param name="debugOptions"></param>
+        internal void AttachDotnetDebuggerToRunningProcess2(DebugOptions debugOptions)
         {
+            NLogService.TraceEnteringMethod(Logger);
+
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            var extensionInstallationDirectory = GetExtensionInstallationDirectoryOrNull();
+            if (extensionInstallationDirectory == null)
+            {
+                Logger.Error($"{nameof(extensionInstallationDirectory)} is null!");
+            }
+
+            var settings = debugOptions.UserSettings;
+
+            var launchJson = settings.LaunchJsonContent;
+            var jsonStringPlinkExe = JsonConvert.SerializeObject(Path.Combine(extensionInstallationDirectory, "plink.exe")).Trim('"');
+            launchJson = launchJson.Replace(settings.PLINK_EXE_PATH, jsonStringPlinkExe);
+
+            var sshPassword = string.IsNullOrWhiteSpace(settings.SSHPrivateKeyFile) ? $"-pw {settings.SSHPassword} {settings.SSHFullUrl}" : $"-i {settings.SSHPrivateKeyFile} {settings.SSHFullUrl}";
+            launchJson = launchJson.Replace(settings.PLINK_SSH_CONNECTION_ARGS, $"{sshPassword} ");
+
+            var jsonStringDeployPath = JsonConvert.SerializeObject(debugOptions.UserSettings.SSHDeployPath).Trim('"');
+            launchJson = launchJson.Replace(settings.DEPLOYMENT_PATH, jsonStringDeployPath);
+            launchJson = launchJson.Replace(settings.TARGET_EXE_FILENAME, debugOptions.TargetExeFileName);
+            var jsonStringStartArguments = JsonConvert.SerializeObject(debugOptions.StartArguments).Trim('"');
+            launchJson = launchJson.Replace(settings.START_ARGUMENTS, jsonStringStartArguments);
+
+            var sp = new ServiceProvider((IServiceProvider)_dte);
+            try
+            {
+                var dbg = sp.GetService(typeof(SVsShellDebugger)) as IVsDebugger4;
+                if (dbg == null)
+                {
+                    Logger.Error($"GetService did not returned SVsShellDebugger");
+                }
+                VsDebugTargetInfo4[] debugTargets = new VsDebugTargetInfo4[1];
+                debugTargets[0].dlo = (uint)DEBUG_LAUNCH_OPERATION.DLO_CreateProcess;
+                debugTargets[0].bstrExe = debugOptions.StartupAssemblyPath;
+                debugTargets[0].bstrCurDir = debugOptions.OutputDirectory;
+                debugTargets[0].bstrArg = debugOptions.StartArguments;
+                debugTargets[0].bstrRemoteMachine = null; // debug locally                
+                //debugTargets[0].grfLaunch = (uint)__VSDBGLAUNCHFLAGS.DBGLAUNCH_StopDebuggingOnEnd; // When this process ends, debugging is stopped.
+                //debugTargets[0].grfLaunch = (uint)__VSDBGLAUNCHFLAGS.DBGLAUNCH_DetachOnStop, // Detaches instead of terminating when debugging stopped.
+                //debugTargets[0].fSendStdoutToOutputWindow = 0,
+                //debugTargets[0].bstrExe = Path.Combine(extensionInstallationDirectory, "plink.exe");
+                debugTargets[0].bstrOptions = launchJson;
+                debugTargets[0].guidLaunchDebugEngine = new Guid("{541B8A8A-6081-4506-9F0A-1CE771DEBC04}");
+                VsDebugTargetProcessInfo[] processInfo = new VsDebugTargetProcessInfo[debugTargets.Length];
+
+                dbg.LaunchDebugTargets4(1, debugTargets, processInfo);
+            }
+            catch (Exception ex)
+            {
+                NLogService.LogError(Logger, ex);
+                string msg = null;
+                var sh = sp.GetService(typeof(SVsUIShell)) as IVsUIShell;
+                if (sh != null)
+                {
+                    sh.GetErrorInfo(out msg);
+                }
+                if (!string.IsNullOrWhiteSpace(msg))
+                {
+                    Logger.Error(msg);
+                }
+                throw;
+            }
+
+            //var launchJsonFile = @"C:\TFS\launch.json";
+            //File.WriteAllText(launchJsonFile, launchJson);
+
+            //Logger.Info($"Project {debugOptions.StartupAssemblyPath} was built successfully. Invoking remote debug command");
+            //var dte2 = _dte as DTE2;
+            //dte2.ExecuteCommand("DebugAdapterHost.Launch", $"/LaunchJson:\"{launchJsonFile}\" /EngineGuid:541B8A8A-6081-4506-9F0A-1CE771DEBC04");
+        }
+
+        public void AttachDotnetDebuggerToRunningProcess(DebugOptions debugOptions)
+        {
+            NLogService.TraceEnteringMethod(Logger);            
+
+            var extensionInstallationDirectory = GetExtensionInstallationDirectoryOrNull();
+            if (extensionInstallationDirectory == null)
+            {
+                Logger.Error($"{nameof(extensionInstallationDirectory)} is null!");
+            }
+
+            var settings = debugOptions.UserSettings;
+
+            var launchJson = settings.LaunchJsonContent;
+            var jsonStringPlinkExe = JsonConvert.SerializeObject(Path.Combine(extensionInstallationDirectory, "plink.exe")).Trim('"');
+            launchJson = launchJson.Replace(settings.PLINK_EXE_PATH, jsonStringPlinkExe);
+
+            var sshPassword = string.IsNullOrWhiteSpace(settings.SSHPrivateKeyFile) ? $"-pw {settings.SSHPassword} {settings.SSHFullUrl}" : $"-i {settings.SSHPrivateKeyFile} {settings.SSHFullUrl}";
+            launchJson = launchJson.Replace(settings.PLINK_SSH_CONNECTION_ARGS, $"{sshPassword} ");
+
+            var jsonStringDeployPath = JsonConvert.SerializeObject(debugOptions.UserSettings.SSHDeployPath).Trim('"');
+            launchJson = launchJson.Replace(settings.DEPLOYMENT_PATH, jsonStringDeployPath);
+            launchJson = launchJson.Replace(settings.TARGET_EXE_FILENAME, debugOptions.TargetExeFileName);
+            var jsonStringStartArguments = JsonConvert.SerializeObject(debugOptions.StartArguments).Trim('"');
+            launchJson = launchJson.Replace(settings.START_ARGUMENTS, jsonStringStartArguments);
+
+            string launchJsonFile = Path.Combine(GetStartupProjectPath(), "launch.json");
+            Logger.Info($"Path of launch.json = {launchJsonFile}");
+            File.WriteAllText(launchJsonFile, launchJson);
+
+            Logger.Info($"Project {debugOptions.StartupAssemblyPath} was built successfully. Invoking remote debug command");
+            var dte2 = _dte as DTE2;
+            dte2.ExecuteCommand("DebugAdapterHost.Launch", $"/LaunchJson:\"{launchJsonFile}\" /EngineGuid:541B8A8A-6081-4506-9F0A-1CE771DEBC04");
+        }
+
+        public DebugOptions CreateDebugOptions(UserSettings settings)
+        {
+            NLogService.TraceEnteringMethod(Logger);
+
             ThreadHelper.ThrowIfNotOnUIThread();
 
             var startupAssemblyPath = GetStartupAssemblyPath();
             var targetExeFileName = Path.GetFileName(startupAssemblyPath);
             var outputDirectory = Path.GetDirectoryName(startupAssemblyPath);
             var startArguments = GetStartArguments();
-            var preDebugScript = settings.PreDebugScriptWithParameters
-                .Replace(settings.MONO_DEBUG_PORT, settings.SSHMonoDebugPort.ToString())
-                .Replace(settings.TARGET_EXE_FILENAME, targetExeFileName)
-                .Replace(settings.START_ARGUMENTS, startArguments)
-                .Replace("\r\n", "\n");
-            var debugScript = settings.DebugScriptWithParameters
-                .Replace(settings.MONO_DEBUG_PORT, settings.SSHMonoDebugPort.ToString())
-                .Replace(settings.TARGET_EXE_FILENAME, targetExeFileName)
-                .Replace(settings.START_ARGUMENTS, startArguments)
-                .Replace("\r\n", "\n");
+
+            var preDebugScript = settings.DeployAndDebugOnLocalWindowsSystem ? settings.PreDebugScriptWithParametersWindows : settings.PreDebugScriptWithParameters;
+            preDebugScript = ReplaceDebugParameters(preDebugScript, settings, targetExeFileName, startArguments, "\n");
+
+            var debugScript = settings.DeployAndDebugOnLocalWindowsSystem ? settings.DebugScriptWithParametersWindows : settings.DebugScriptWithParameters;
+            debugScript = ReplaceDebugParameters(debugScript, settings, targetExeFileName, startArguments, "\n");
 
             var debugOptions = new DebugOptions()
             {
-                UseSSH = useSSH,
                 StartupAssemblyPath = startupAssemblyPath,
                 UserSettings = settings,
                 OutputDirectory = outputDirectory,
                 TargetExeFileName = targetExeFileName,
                 StartArguments = startArguments,
                 PreDebugScript = preDebugScript,
-                DebugScript = debugScript,
+                DebugScript = debugScript
             };
 
             return debugOptions;
         }
 
+        private string ReplaceDebugParameters(string scriptWithParameters, UserSettings settings, string targetExeFileName, string startArguments, string endOfLine)
+        {
+            return (scriptWithParameters ?? string.Empty)
+                .Replace(settings.MONO_DEBUG_PORT, settings.SSHMonoDebugPort.ToString())
+                .Replace(settings.TARGET_EXE_FILENAME, targetExeFileName)
+                .Replace(settings.START_ARGUMENTS, startArguments)
+                .Replace("\r\n", endOfLine);
+        }
+
         public async Task CreateMdbForAllDependantProjectsAsync(Action<string> msgOutput)
         {
+            NLogService.TraceEnteringMethod(Logger);
+
             await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
             var sb = (SolutionBuild2)_dte.Solution.SolutionBuild;
@@ -414,19 +581,19 @@ namespace VSMonoDebugger
                 {
                     if (outputDirectories.ContainsKey(projectName))
                     {
-                        var outputDir = outputDirectories[projectName];
-                        LogInfo($"{projectName} - OutputDir: {outputDir}");
+                        var outputDir = Path.GetFullPath(outputDirectories[projectName]);
+                        Logger.Info($"{projectName} - OutputDir: {outputDir}");
 
                         await ConvertPdb2MdbAsync(outputDir, msgOutput);
                     }
                     else
                     {
-                        LogInfo($"{projectName} - OutputDir: NOT FOUND!");
+                        Logger.Info($"{projectName} - OutputDir: NOT FOUND!");
                     }
                 }
                 catch (Exception ex)
                 {
-                    LogError(ex);
+                    NLogService.LogError(Logger, ex);
                 }
             }
         }
@@ -441,12 +608,12 @@ namespace VSMonoDebugger
                 try
                 {
                     msgOutput($"### CollectOutputDirectories: Propertes of project '{dep.Project.Name}'");
-                    LogInfo($"### CollectOutputDirectories: Propertes of project '{dep.Project.Name}'");
+                    Logger.Info($"### CollectOutputDirectories: Propertes of project '{dep.Project.Name}'");
 
                     if (!IsCSharpProject(dep.Project))
                     {
                         msgOutput($"Only C# projects are supported project! ProjectName = {dep.Project.Name} Language = {dep.Project.CodeModel.Language}");
-                        LogInfo($"Only C# projects are supported project! ProjectName = {dep.Project.Name} Language = {dep.Project.CodeModel.Language}");
+                        Logger.Info($"Only C# projects are supported project! ProjectName = {dep.Project.Name} Language = {dep.Project.CodeModel.Language}");
                         continue;
                     }
 
@@ -456,13 +623,13 @@ namespace VSMonoDebugger
                         continue;
                     }
                     msgOutput($"OutputFullPath = {outputDir}");
-                    LogInfo($"OutputFullPath = {outputDir}");
+                    Logger.Info($"OutputFullPath = {outputDir}");
                     outputPaths[dep.Project.FullName] = outputDir;
                 }
                 catch (Exception ex)
                 {
                     msgOutput($"### CollectOutputDirectories: unsupported project - error was: '{ex.Message}'");
-                    LogInfo($"### CollectOutputDirectories: unsupported project - error was: '{ex.Message}'");
+                    Logger.Info($"### CollectOutputDirectories: unsupported project - error was: '{ex.Message}'");
                 }
             }
             return outputPaths;
@@ -497,7 +664,7 @@ namespace VSMonoDebugger
             }
             catch
             {
-                LogInfo($"OutputPath not available!");
+                Logger.Info($"OutputPath not available!");
                 return null;
             }
 
@@ -505,7 +672,7 @@ namespace VSMonoDebugger
             return outputDir;
         }
 
-        public Dictionary<string, Project> CollectAllDependentProjects(Project currentProject, Action<string> msgOutput, Dictionary<string, Project> projects = null)
+        private Dictionary<string, Project> CollectAllDependentProjects(Project currentProject, Action<string> msgOutput, Dictionary<string, Project> projects = null)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
@@ -537,7 +704,7 @@ namespace VSMonoDebugger
             return projects;
         }
 
-        public Task ConvertPdb2MdbAsync(string outputDirectory, Action<string> msgOutput)
+        private Task ConvertPdb2MdbAsync(string outputDirectory, Action<string> msgOutput)
         {
             return Task.Run(() =>
             {
@@ -570,23 +737,13 @@ namespace VSMonoDebugger
                     }
                     catch (Exception ex)
                     {
+                        NLogService.LogError(Logger, ex);
                         msgOutput?.Invoke($"Error while creating mdb file for {file}. {ex.Message}");
                     }                    
                 }
 
                 msgOutput?.Invoke($"End ConvertPdb2Mdb.");
             });
-        }
-
-        public void LogInfo(string message)
-        {
-            logger.Log(new LogEventInfo(LogLevel.Info, "MonoVisualStudioExtension", message));
-
-        }
-
-        public void LogError(Exception ex)
-        {
-            logger.Error(ex);
         }
     }
 }
