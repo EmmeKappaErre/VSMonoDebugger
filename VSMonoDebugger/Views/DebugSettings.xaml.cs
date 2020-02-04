@@ -80,18 +80,12 @@ namespace VSMonoDebugger.Views
 
         private void SetDefaultPreDebugScript(object sender, RoutedEventArgs e)
         {
-            if (ViewModel?.SettingsContainer?.CurrentUserSettings != null)
-            {
-                ViewModel.SettingsContainer.CurrentUserSettings.PreDebugScriptWithParameters = "";
-            }
+            ViewModel?.SettingsContainer?.CurrentUserSettings?.SetDefaultPreDebugScript();
         }
 
         private void SetDefaultDebugScript(object sender, RoutedEventArgs e)
         {
-            if (ViewModel?.SettingsContainer?.CurrentUserSettings != null)
-            {
-                ViewModel.SettingsContainer.CurrentUserSettings.DebugScriptWithParameters = "";
-            }
+            ViewModel?.SettingsContainer?.CurrentUserSettings?.SetDefaultDebugScript();
         }
         
         private void Button_Click(object sender, RoutedEventArgs e)
@@ -125,6 +119,34 @@ namespace VSMonoDebugger.Views
                     ViewModel.SettingsContainer.CurrentUserSettings.SSHPrivateKeyFile = openFileDialog.FileName;
                 }
             }
+        }
+
+        private const string DialogFilter = "Settings.VSMonoDebugger json files (*.VSMonoDebugger.json)|*.VSMonoDebugger.json|All files (*.*)|*.*";
+
+        private void SaveAs(object sender, RoutedEventArgs e)
+        {
+            var dialog = new SaveFileDialog();
+            dialog.FileName = "Settings.VSMonoDebugger.json";
+            dialog.Filter = DialogFilter;
+            if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+            {
+                ViewModel?.SaveAsDebugSettings(dialog.FileName);
+            }
+        }
+
+        private void LoadFrom(object sender, RoutedEventArgs e)
+        {
+            var dialog = new OpenFileDialog();
+            dialog.Filter = DialogFilter;
+            if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+            {
+                ViewModel?.LoadFromDebugSettings(dialog.FileName);
+            }            
+        }
+
+        private void SetDefaultLaunchJsonContent(object sender, RoutedEventArgs e)
+        {
+            ViewModel?.SettingsContainer?.CurrentUserSettings?.SetDefaultLaunchJsonContent();
         }
     }
 }
